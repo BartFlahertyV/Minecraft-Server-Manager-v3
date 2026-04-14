@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
+BASE_DIR_DEFAULT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# If MINECRAFT_BASE_DIR is set but invalid, fall back to the script location.
+if [[ -n "${MINECRAFT_BASE_DIR:-}" && -f "${MINECRAFT_BASE_DIR}/config/global.conf" ]]; then
+  export MINECRAFT_BASE_DIR
+else
+  export MINECRAFT_BASE_DIR="${BASE_DIR_DEFAULT}"
+fi
+
+# shellcheck disable=SC1091
+source "${MINECRAFT_BASE_DIR}/tools/lib.sh"
+
+current_server() {
+  active_server || true
+}
+
+usage() {
+  cat <<USAGE
+Minecraft Server Manager v3
+
+Usage:
+  mcadmin
+  mcadmin status [server] [--json]
+  mcadmin doctor [server] [--json]
+  mcadmin health [server] [--json]
+  mcadmin start [server]
+  mcadmin stop [server]
+  mcadmin restart [server]
+  mcadmin switch <server> [--start]
+  mcadmin backup now [server]
+  mcadmin restore list [server]
+  mcadmin restore latest [server]
+  mcadmin logs [runtime|backup|restore|restart|crash|admin] [server]
+  mcadmin timers
+  mcadmin attach [server]
+  mcadmin console [server]
+  mcadmin send-command <command...>
+  mcadmin unlock-crash [server]
+  mcadmin clone <src> <dst>
+  mcadmin archive <server>
+  mcadmin delete <server> --force
+  mcadmin test
+  mcadmin test all
+  mcadmin test <name>
+
+Examples:
+  mcadmin status
+  mcadmin switch atm10-6-5 --start
+  mcadmin attach
+  mcadmin send-command "say Server restart in 5 minutes"
+USAGE
+}
+
+show_menu() {
+  local srv
+  srv="$(current_server)"
+
+  echo "Minecraft Server Manager v3"
+  echo "Base directory : ${MINECRAFT_BASE_DIR}"
+  echo "Active server  : ${srv:-none}"
+  echo
+  cat <<'MENU'
+1) Status
+2) Doctor
+3) Start
+4) Stop
+5) Restart
+6) Backup now
+7) Restore latest
+8) Timers
+9) Runtime log tail
+10) Attach console
+11) Unlock crash
+12) Exit
+MENU
+
+  read -r -p "Choose: " c
+  case "${c}" in
+    1) "${SCRIPT_DIR}/status-server.sh" "$(current_server)" ;;
+    2) "${SCRIPT_DIR}/doctor.sh" "$(current_server)" ;;
+    3) "${SCRIPT_DIR}/run-server.sh" "$(current_server)" ;;
+    4) "${SCRIPT_DIR}/stop-server.sh" "$(current_server)" ;;
+    5)
+      srv="$(current_server)"
+      "${SCRIPT_DIR}/stop-server.sh" "${srv}"
+      "${SCRIPT_DIR}/run-server.sh" "${srv}"
+      ;;
+    6) "${SCRIPT_DIR}/backup-server.sh" "$(current_server)" ;;
+    7) "${SCRIPT_DIR}/restore-server.sh" "$(current_server)" latest ;;
+    8)
+      systemctl list-timers --all | grep -E 'minecraft-.*(backup|scheduled-restart)\.timer|NEXT|LEFT' || true
+      ;;
+    9)
+      load_server "$(current_server)"
+      tail -n 100 "${RUNTIME_LOG}"
+      ;;
+    10)
+      load_server "$(current_server)"
+      tmux_cmd attach -t "${TMUX_SESSION}"
+      ;;
+    11) "${TOOLS_DIR}/clear-crash-lock.sh" "$(current_server)" ;;
+    12) exit 0 ;;
+    *) echo "Invalid choice" ;;
+  esac
+}
+
+cmd="${1:-}"
+if [[ -z "${cmd}" ]]; then
+  show_menu
+  exit 0
+fi
+
+case "${cmd}" in
+  help|-h|--help)
+    usage
+    ;;
+
+  status)
+    shift
+    exec "${SCRIPT_DIR}/status-server.sh" "$@"
+    ;;
+
+  doctor|health)
+    shift
+    exec "${SCRIPT_DIR}/doctor.sh" "$@"
+    ;;
+
+  start)
+    shift
+    exec "${SCRIPT_DIR}/run-server.sh" "${1:-$(current_server)}"
+    ;;
+
+  stop)
+    shift
+    exec "${SCRIPT_DIR}/stop-server.sh" "${1:-$(current_server)}"
+    ;;
+
+  restart)
+    shift
+    srv="${1:-$(current_server)}"
+    "${SCRIPT_DIR}/stop-server.sh" "${srv}"
+    exec "${SCRIPT_DIR}/run-server.sh" "${srv}"
+    ;;
+
+  switch)
+    shift
+    exec "${SCRIPT_DIR}/switch-server.sh" "$@"
+    ;;
+
+  backup)
+    shift
+    sub="${1:-}"
+    case "${sub}" in
+      now)
+        exec "${SCRIPT_DIR}/backup-server.sh" "${2:-$(current_server)}"
+        ;;
+      *)
+        die "usage: mcadmin backup now [server]"
+        ;;
+    esac
+    ;;
+
+  restore)
+    shift
+    sub="${1:-}"
+    srv="${2:-$(current_server)}"
+    case "${sub}" in
+      list)
+        exec "${SCRIPT_DIR}/restore-server.sh" "${srv}" list
+        ;;
+      latest)
+        exec "${SCRIPT_DIR}/restore-server.sh" "${srv}" latest
+        ;;
+      *)
+        die "usage: mcadmin restore list [server] | mcadmin restore latest [server]"
+        ;;
+    esac
+    ;;
+
+  logs)
+    shift
+    kind="${1:-runtime}"
+    srv="${2:-$(current_server)}"
+    load_server "${srv}"
+    case "${kind}" in
+      runtime) tail -n 100 "${RUNTIME_LOG}" ;;
+      backup) tail -n 100 "${BACKUP_LOG}" ;;
+      restore) tail -n 100 "${RESTORE_LOG}" ;;
+      restart) tail -n 100 "${RESTART_LOG}" ;;
+      crash) tail -n 100 "${CRASH_LOG}" ;;
+      admin) tail -n 100 "${ADMIN_LOG}" ;;
+      *) die "unknown log kind: ${kind}" ;;
+    esac
+    ;;
+
+  timers)
+    systemctl list-timers --all | grep -E 'minecraft-.*(backup|scheduled-restart)\.timer|NEXT|LEFT' || true
+    ;;
+
+  attach|console)
+    shift
+    srv="${1:-$(current_server)}"
+    load_server "${srv}"
+    tmux_cmd attach -t "${TMUX_SESSION}"
+    ;;
+
+  send-command)
+    shift
+    [[ $# -gt 0 ]] || die "usage: mcadmin send-command <command...>"
+    srv="$(current_server)"
+    load_server "${srv}"
+    cmd_text="$*"
+    tmux_cmd send-keys -t "${TMUX_SESSION}" "${cmd_text}" C-m
+    echo "Sent command to ${SERVER_NAME}: ${cmd_text}"
+    ;;
+
+  unlock-crash)
+    shift
+    exec "${TOOLS_DIR}/clear-crash-lock.sh" "${1:-$(current_server)}"
+    ;;
+
+  clone)
+    shift
+    exec "${TOOLS_DIR}/clone-server.sh" "$@"
+    ;;
+
+  archive)
+    shift
+    exec "${TOOLS_DIR}/archive-server.sh" "$@"
+    ;;
+
+  delete)
+    shift
+    exec "${TOOLS_DIR}/delete-server.sh" "$@"
+    ;;
+
+  test)
+    shift
+    sub="${1:-all}"
+    case "${sub}" in
+      all)
+        exec "${TESTS_DIR}/run-all-tests.sh"
+        ;;
+      *)
+        exec "${TESTS_DIR}/test-${sub}.sh"
+        ;;
+    esac
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac

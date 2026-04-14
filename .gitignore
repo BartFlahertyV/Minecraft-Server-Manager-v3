@@ -1,0 +1,19 @@
+# Live server data
+servers/*
+!servers/.gitkeep
+
+# Runtime/generated data
+runtime/
+backups/local/
+backups/manifests/
+archives/
+active_server.txt
+
+# Logs/temp
+*.log
+*.tmp
+*.pid
+
+# OS junk
+.DS_Store
+Thumbs.db
